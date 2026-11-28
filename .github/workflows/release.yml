@@ -4,10 +4,36 @@ on:
   push:
     tags:
       - "v[0-9]*.[0-9]*"
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag created by CI (e.g. v1.1.0)"
+        required: true
+        type: string
+      prev_tag:
+        description: "Previous release tag for changelog comparison"
+        required: false
+        default: ""
+        type: string
+      prerelease:
+        description: "Mark as GitHub Pre-release"
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: "Create as Draft Release"
+        required: false
+        default: false
+        type: boolean
+      skip_verify:
+        description: "Skip duplicate unit-test gate when already passed in caller CI"
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create & publish (e.g. v2.0.0 or v2.1.0-beta.1)"
+        description: "Release tag to create & publish (e.g. v1.1.0 or v1.2.0-beta.1)"
         required: true
         type: string
       prerelease:
@@ -22,7 +48,7 @@ on:
         type: boolean
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -35,6 +61,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
+      prev_tag: ${{ steps.meta.outputs.prev_tag }}
       is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
     steps:
       - name: Enforce main branch on manual dispatch
@@ -55,6 +82,7 @@ jobs:
         id: meta
         env:
           INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PREV_TAG: ${{ inputs.prev_tag }}
           INPUT_PRE: ${{ inputs.prerelease }}
         run: |
           TAG="${INPUT_TAG:-$GITHUB_REF_NAME}"
@@ -67,9 +95,11 @@ jobs:
             IS_PRE="true"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prev_tag=$INPUT_PREV_TAG" >> "$GITHUB_OUTPUT"
           echo "is_prerelease=$IS_PRE" >> "$GITHUB_OUTPUT"
 
       - name: Verify i18n, build scripts & unit tests
+        if: inputs.skip_verify != true
         run: |
           python3 tools/gen_cjk_font.py --check-tables
           python3 -m py_compile scripts/build/*.py tools/gen_cjk_font.py tools/gen_web_manifests.py tools/hil_smoke_test.py
@@ -251,13 +281,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Checkout release packaging scripts, partitions & sd_files
+      - name: Checkout release packaging scripts, partitions, sd_files & git history
         uses: actions/checkout@v7
         with:
+          fetch-depth: 0
+          fetch-tags: true
           sparse-checkout: |
             scripts/build
             partitions
             sd_files
+
+      - name: Ensure annotated Git tag exists on origin
+        env:
+          RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          if ! git rev-parse -q --verify "refs/tags/${RELEASE_TAG}" >/dev/null; then
+            git config user.name "nezha-cyber-bot"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$RELEASE_TAG" -m "Nezha Cyber (哪吒网络安全) $RELEASE_TAG"
+            git push origin "refs/tags/${RELEASE_TAG}"
+          fi
 
       - name: Download all built firmware artifacts
         uses: actions/download-artifact@v8
@@ -272,20 +315,24 @@ jobs:
             zip -r -q release-assets/NezhaCyber-sd-files.zip sd_files
           fi
 
-      - name: Generate SHA256SUMS.txt, manifest.json & Release Notes with memory table
+      - name: Generate SHA256SUMS.txt, manifest.json & rich Release Notes with changelog + memory table
         env:
           RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+          PREV_TAG: ${{ needs.verify.outputs.prev_tag }}
           RELEASE_CHANNEL: ${{ needs.verify.outputs.is_prerelease == 'true' && 'beta' || 'stable' }}
           REPO_NAME: ${{ github.repository }}
         run: |
           python3 scripts/build/package_release.py \
             --assets-dir release-assets \
             --tag "$RELEASE_TAG" \
+            --prev-tag "$PREV_TAG" \
+            --repo-dir . \
             --channel "$RELEASE_CHANNEL" \
             --repo "$REPO_NAME" \
             --notes-out RELEASE_NOTES.md
           test -s release-assets/manifest.json
           test -s release-assets/SHA256SUMS.txt
+          test -s RELEASE_NOTES.md
 
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v3
@@ -293,10 +340,10 @@ jobs:
           tag_name: ${{ needs.verify.outputs.tag }}
           name: "🔥 Nezha Cyber (哪吒网络安全) ${{ needs.verify.outputs.tag }}"
           body_path: RELEASE_NOTES.md
-          generate_release_notes: true
-          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == true }}
+          generate_release_notes: false
+          draft: ${{ inputs.draft == true }}
           prerelease: ${{ needs.verify.outputs.is_prerelease == 'true' }}
-          make_latest: ${{ (needs.verify.outputs.is_prerelease != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.draft == true)) && 'true' || 'false' }}
+          make_latest: ${{ (needs.verify.outputs.is_prerelease != 'true' && inputs.draft != true) && 'true' || 'false' }}
           fail_on_unmatched_files: false
           files: |
             release-assets/NezhaCyber-*.bin

@@ -1,0 +1,22 @@
+title = "Nezha Cyber Firmware — Gitleaks Configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Ignore generated bitmap/font headers, lockfiles, and benign firmware sample fixtures"
+paths = [
+  '''^src/core/cjk_font_data\.h$''',
+  '''^portal/package-lock\.json$''',
+  '''^portal/tests/''',
+  '''^test/''',
+  '''^sd_files/''',
+  '''^media/''',
+  '''^docs/''',
+  '''^THIRD_PARTY\.md$''',
+]
+regexes = [
+  '''nezhanet''',
+  '''NezhaNet''',
+  '''YOUR_API_KEY|REPLACE_ME|EXAMPLE_TOKEN|DUMMY_SECRET''',
+]

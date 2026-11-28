@@ -3,18 +3,24 @@
 #include "rf_encoder.h"
 #include "rf_presets.h"
 #include "rf_protocol_engine.h"
+#include <cctype>
 #include <cerrno>
-#include <sstream>
+#include <cstdlib>
+#include <cstring>
 
 bool rf_protocol_transmit_raw(const char *input) {
     if (!input || strlen(input) > 262144) return false;
-    std::istringstream file(input);
-    std::string line, preset, protocol;
+    std::string preset, protocol;
     uint32_t frequency = 0;
     std::vector<int> pulses;
     uint64_t total = 0;
     bool gotPreset = false, gotFrequency = false, gotProtocol = false;
-    while (std::getline(file, line)) {
+    const char *cursor = input;
+    while (*cursor) {
+        const char *nl = strchr(cursor, '\n');
+        size_t lineLen = nl ? static_cast<size_t>(nl - cursor) : strlen(cursor);
+        std::string line(cursor, lineLen);
+        cursor = nl ? nl + 1 : cursor + lineLen;
         const auto colon = line.find(':');
         if (colon == std::string::npos) continue;
         std::string key = line.substr(0, colon), value = line.substr(colon + 1);
@@ -41,18 +47,20 @@ bool rf_protocol_transmit_raw(const char *input) {
             gotProtocol = true;
         } else if (key == "Bruce_Buffer_Full" && value != "0") return false;
         else if (key == "RAW_Data" || key == "Data_RAW") {
-            std::istringstream values(value);
-            std::string token;
-            while (values >> token) {
+            const char *vp = value.c_str();
+            while (*vp) {
+                while (*vp && isspace(static_cast<unsigned char>(*vp))) ++vp;
+                if (!*vp) break;
                 errno = 0;
-                char *end;
-                long v = strtol(token.c_str(), &end, 10);
-                if (errno || *end || end == token.c_str() || !v || v < -1000000 || v > 1000000 ||
-                    pulses.size() >= 16384)
+                char *end = nullptr;
+                long v = strtol(vp, &end, 10);
+                if (errno || end == vp || (*end != '\0' && !isspace(static_cast<unsigned char>(*end))) ||
+                    !v || v < -1000000 || v > 1000000 || pulses.size() >= 16384)
                     return false;
                 total += v > 0 ? v : -v;
                 if (total > 10000000) return false;
                 pulses.push_back(int(v));
+                vp = end;
             }
         }
     }

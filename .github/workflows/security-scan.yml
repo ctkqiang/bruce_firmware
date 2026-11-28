@@ -1,0 +1,138 @@
+name: Security — Gitleaks & Static Code Scan
+
+on:
+  push:
+    branches: [main, development]
+  pull_request:
+    branches: [main, development]
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  gitleaks:
+    name: Secret Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks secret scan (open-source CLI, org-compatible)
+        id: scan
+        continue-on-error: true
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          LOG_ARGS=()
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$PR_BASE_SHA" ] && [ -n "$PR_HEAD_SHA" ]; then
+            LOG_ARGS=(--log-opts="${PR_BASE_SHA}..${PR_HEAD_SHA}")
+          else
+            # Scan recent commit window on push/schedule to keep runtime fast while covering new commits
+            LOG_ARGS=(--log-opts="-n 50")
+          fi
+
+          docker run --rm \
+            -v "${{ github.workspace }}:/repo" \
+            -w /repo \
+            ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            git \
+            --config=/repo/.gitleaks.toml \
+            --redact \
+            --verbose \
+            --report-format=sarif \
+            --report-path=/repo/gitleaks.sarif \
+            "${LOG_ARGS[@]}" \
+            /repo
+
+      - name: Upload Gitleaks SARIF to GitHub Code Scanning
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks-secret-scan
+
+      - name: Upload Gitleaks SARIF artifact
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: gitleaks-sarif
+          path: gitleaks.sarif
+          retention-days: 14
+
+      - name: Enforce zero leaked secrets
+        if: steps.scan.outcome != 'success'
+        run: |
+          echo "::error::Gitleaks detected potential hardcoded secrets or credentials. Inspect the gitleaks.sarif artifact or Security tab."
+          exit 1
+
+  static-code-scan:
+    name: Static Code Scan (C/C++, Python & Portal)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Install cppcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq cppcheck
+
+      - name: Run C/C++ static analysis (cppcheck on src/ & include/)
+        run: |
+          cppcheck \
+            --enable=warning,performance,portability \
+            --error-exitcode=0 \
+            --inline-suppr \
+            --suppress=missingIncludeSystem \
+            --suppress=missingInclude \
+            --suppress=unmatchedSuppression \
+            --suppress=unusedFunction \
+            --std=c++17 \
+            --quiet \
+            -j"$(nproc)" \
+            --template='{file}:{line}: [{severity}:{id}] {message}' \
+            src/ include/ 2>&1 | tee cppcheck-report.txt
+          ERR_COUNT=$(grep -c '\[error:' cppcheck-report.txt || true)
+          WARN_COUNT=$(grep -c '\[warning:' cppcheck-report.txt || true)
+          echo "### Static Code Scan Summary (cppcheck)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Errors: \`$ERR_COUNT\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Warnings: \`$WARN_COUNT\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ERR_COUNT" -gt 0 ]; then
+            echo "::warning::cppcheck reported $ERR_COUNT error-level diagnostics; review cppcheck-report.txt artifact."
+          fi
+
+      - name: Check Python scripts for unsafe patterns & syntax
+        run: |
+          python3 -m py_compile scripts/build/*.py tools/*.py
+          if grep -rnE '\b(eval|exec)\s*\(|shell\s*=\s*True' scripts/build/ tools/; then
+            echo "::warning::Review shell=True or dynamic execution usage in Python helper scripts."
+          fi
+
+      - name: Audit Web Portal npm dependencies (high/critical)
+        if: hashFiles('portal/package-lock.json') != ''
+        working-directory: portal
+        continue-on-error: true
+        run: npm audit --audit-level=high
+
+      - name: Upload static scan report
+        if: always() && hashFiles('cppcheck-report.txt') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: static-code-scan-report
+          path: cppcheck-report.txt
+          retention-days: 14

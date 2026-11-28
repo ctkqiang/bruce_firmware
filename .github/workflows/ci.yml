@@ -26,9 +26,12 @@ on:
       - ".github/copilot-instructions.md"
       - ".github/dependabot.yml"
       - ".github/workflows/manual-board-build.yml"
+      - ".github/workflows/open-code-review.yml"
       - ".github/workflows/pages.yml"
       - ".github/workflows/release.yml"
+      - ".github/workflows/security-scan.yml"
       - ".github/workflows/stale.yml"
+      - ".gitleaks.toml"
   pull_request:
     branches: [main]
     paths-ignore:
@@ -54,13 +57,21 @@ on:
       - ".github/copilot-instructions.md"
       - ".github/dependabot.yml"
       - ".github/workflows/manual-board-build.yml"
+      - ".github/workflows/open-code-review.yml"
       - ".github/workflows/pages.yml"
       - ".github/workflows/release.yml"
+      - ".github/workflows/security-scan.yml"
       - ".github/workflows/stale.yml"
+      - ".gitleaks.toml"
   workflow_dispatch:
     inputs:
       full_matrix:
         description: "Build all 4 CI boards instead of the 2-tier default (16MB S3 + 4MB ESP32)"
+        required: false
+        default: false
+        type: boolean
+      auto_release:
+        description: "Auto-create next SemVer git tag & publish GitHub Release after build passes (main branch only)"
         required: false
         default: false
         type: boolean
@@ -196,3 +207,60 @@ jobs:
           path: NezhaCyber-${{ matrix.env }}.bin
           if-no-files-found: error
           retention-days: 5
+
+  auto-tag:
+    name: Auto-Tag SemVer Release (main)
+    needs: [verify, build]
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.verify.outputs.build_firmware == 'true') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.auto_release == true)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      should_release: ${{ steps.tag.outputs.should_release }}
+      next_tag: ${{ steps.tag.outputs.next_tag }}
+      prev_tag: ${{ steps.tag.outputs.prev_tag }}
+    steps:
+      - name: Checkout repository with full git history & tags
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Compute & push next SemVer Git tag
+        id: tag
+        run: |
+          TAG_JSON=$(python3 scripts/build/next_release_tag.py --repo-dir . --github-output "$GITHUB_OUTPUT")
+          SHOULD_RELEASE=$(python3 -c 'import json, sys; print(str(json.loads(sys.argv[1])["should_release"]).lower())' "$TAG_JSON")
+          NEXT_TAG=$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["next_tag"])' "$TAG_JSON")
+          PREV_TAG=$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["prev_tag"])' "$TAG_JSON")
+          if [ "$SHOULD_RELEASE" = "true" ]; then
+            git config user.name "nezha-cyber-bot"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$NEXT_TAG" -m "Nezha Cyber (哪吒网络安全) $NEXT_TAG"
+            git push origin "refs/tags/${NEXT_TAG}"
+            echo "Created and pushed annotated Git tag: $NEXT_TAG (previous: ${PREV_TAG:-none})"
+          else
+            echo "HEAD is already tagged (${NEXT_TAG:-unknown}); skipping duplicate tag."
+          fi
+
+  release:
+    name: Publish Tagged GitHub Release
+    needs: [verify, build, auto-tag]
+    if: needs.auto-tag.outputs.should_release == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.auto-tag.outputs.next_tag }}
+      prev_tag: ${{ needs.auto-tag.outputs.prev_tag }}
+      prerelease: false
+      draft: false
+      skip_verify: true
