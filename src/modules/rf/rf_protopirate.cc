@@ -11,11 +11,14 @@
 #include "rf_scan.h"
 #include <ArduinoJson.h>
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <climits>
+#include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <map>
 #include <memory>
-#include <sstream>
 
 namespace {
 struct Entry {
@@ -31,30 +34,50 @@ struct Entry {
     size_t bytes() const { return metadataBytes() + rawData().length(); }
 };
 String field(const String &text, const char *name) {
-    std::istringstream lines(text.c_str());
-    std::string line;
-    const std::string prefix = std::string(name) + ":";
-    while (std::getline(lines, line))
-        if (line.compare(0, prefix.size(), prefix) == 0) {
-            String value = line.substr(prefix.size()).c_str();
+    const size_t nameLen = strlen(name);
+    const char *cursor = text.c_str();
+    while (*cursor) {
+        const char *nl = strchr(cursor, '\n');
+        size_t lineLen = nl ? static_cast<size_t>(nl - cursor) : strlen(cursor);
+        if (lineLen > nameLen && memcmp(cursor, name, nameLen) == 0 && cursor[nameLen] == ':') {
+            String value;
+            value.concat(cursor + nameLen + 1, static_cast<unsigned int>(lineLen - nameLen - 1));
             value.trim();
             return value;
         }
+        cursor = nl ? nl + 1 : cursor + lineLen;
+    }
     return "";
 }
 String setField(const String &text, const char *name, const String &value) {
-    std::istringstream lines(text.c_str());
-    std::string line;
+    const size_t nameLen = strlen(name);
     String result;
+    result.reserve(text.length() + value.length() + nameLen + 8);
     bool found = false;
-    const std::string prefix = std::string(name) + ":";
-    while (std::getline(lines, line)) {
-        if (line.compare(0, prefix.size(), prefix) == 0) {
-            if (!found) result += String(name) + ": " + value + "\n";
+    const char *cursor = text.c_str();
+    while (*cursor) {
+        const char *nl = strchr(cursor, '\n');
+        size_t lineLen = nl ? static_cast<size_t>(nl - cursor) : strlen(cursor);
+        if (lineLen > nameLen && memcmp(cursor, name, nameLen) == 0 && cursor[nameLen] == ':') {
+            if (!found) {
+                result += name;
+                result += ": ";
+                result += value;
+                result += "\n";
+            }
             found = true;
-        } else result += String(line.c_str()) + "\n";
+        } else {
+            result.concat(cursor, static_cast<unsigned int>(lineLen));
+            result += "\n";
+        }
+        cursor = nl ? nl + 1 : cursor + lineLen;
     }
-    if (!found) result += String(name) + ": " + value + "\n";
+    if (!found) {
+        result += name;
+        result += ": ";
+        result += value;
+        result += "\n";
+    }
     return result;
 }
 bool number(const String &text, uint32_t &value) {
@@ -340,35 +363,47 @@ class ProtoPirate {
             displayError("No RAW waveform", true);
             return;
         }
-        std::istringstream lines(raw.c_str());
-        std::string line;
         uint64_t total = 0;
         unsigned count = 0, high = 0, low = 0;
         int smallest = INT_MAX, largest = 0;
         std::map<int, unsigned> bins;
-        while (std::getline(lines, line)) {
-            if (line.compare(0, 9, "RAW_Data:") && line.compare(0, 9, "Data_RAW:")) continue;
-            std::istringstream values(line.substr(9));
-            long long pulse;
-            while (values >> pulse) {
-                if (!pulse || pulse < -1000000 || pulse > 1000000 || count >= 16384) {
-                    displayError("Invalid RAW durations", true);
-                    return;
+        const char *cursor = raw.c_str();
+        while (*cursor) {
+            const char *nl = strchr(cursor, '\n');
+            size_t lineLen = nl ? static_cast<size_t>(nl - cursor) : strlen(cursor);
+            const char *lineEnd = cursor + lineLen;
+            if (lineLen >= 9 &&
+                (memcmp(cursor, "RAW_Data:", 9) == 0 || memcmp(cursor, "Data_RAW:", 9) == 0)) {
+                std::string rest(cursor + 9, lineLen - 9);
+                const char *vp = rest.c_str();
+                while (*vp) {
+                    while (*vp && isspace(static_cast<unsigned char>(*vp))) ++vp;
+                    if (!*vp) break;
+                    errno = 0;
+                    char *end = nullptr;
+                    long long pulse = strtoll(vp, &end, 10);
+                    if (errno || end == vp ||
+                        (*end != '\0' && !isspace(static_cast<unsigned char>(*end)))) {
+                        displayError("Malformed RAW data", true);
+                        return;
+                    }
+                    if (!pulse || pulse < -1000000 || pulse > 1000000 || count >= 16384) {
+                        displayError("Invalid RAW durations", true);
+                        return;
+                    }
+                    int duration = pulse < 0 ? -pulse : pulse;
+                    total += duration;
+                    count++;
+                    if (pulse > 0) high++;
+                    else low++;
+                    smallest = std::min(smallest, duration);
+                    largest = std::max(largest, duration);
+                    int bucket = ((duration + 25) / 50) * 50;
+                    if (bins.count(bucket) || bins.size() < 128) bins[bucket]++;
+                    vp = end;
                 }
-                int duration = pulse < 0 ? -pulse : pulse;
-                total += duration;
-                count++;
-                if (pulse > 0) high++;
-                else low++;
-                smallest = std::min(smallest, duration);
-                largest = std::max(largest, duration);
-                int bucket = ((duration + 25) / 50) * 50;
-                if (bins.count(bucket) || bins.size() < 128) bins[bucket]++;
             }
-            if (!values.eof()) {
-                displayError("Malformed RAW data", true);
-                return;
-            }
+            cursor = nl ? nl + 1 : lineEnd;
         }
         if (!count) {
             displayError("No RAW durations", true);

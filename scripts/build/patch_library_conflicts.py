@@ -200,6 +200,38 @@ conflicts = [
         r'#define RFAL_NFCA_N_RETRANS         2U',
         '#define RFAL_NFCA_N_RETRANS         4U'
     ),
+    # BER-TLV ships a desktop unit-test runner (int main() + <iostream>) inside src/.
+    # Including <iostream> registers static std::ios_base::Init in .init_array, which
+    # prevents --gc-sections from stripping ~150-250 KB of libstdc++ locale/iostream
+    # bloat on every ESP32 board (especially 4 MB flash targets like m5stack-cplus1_1).
+    (
+        ".pio/libdeps/*/BER-TLV/src/tests.cpp",
+        r'(?s)\A#include <iostream>.*\Z',
+        '// Patched by patch_library_conflicts.py: disable desktop test main() + <iostream> bloat\n'
+    ),
+    # ESP PN532 UART uses <sstream> + <iomanip> solely to format bytes as uppercase hex,
+    # dragging in libstdc++ std::locale facets. Replace with a zero-overhead hex table.
+    (
+        ".pio/libdeps/*/ESP PN532 UART/src/TagTechnology.cpp",
+        r'(?s)#include <sstream>\s*\n#include <iomanip>.*?return hexStream\.str\(\);\s*\}',
+        '#include <string.h>\n'
+        '#include <algorithm>\n'
+        '\n'
+        'std::string TagTechnology::bytesToHexString(std::vector<uint8_t> *data, bool reverse)\n'
+        '{\n'
+        '    if (reverse) {\n'
+        '        std::reverse(data->begin(), data->end());\n'
+        '    }\n'
+        '    static const char kHex[] = "0123456789ABCDEF";\n'
+        '    std::string out;\n'
+        '    out.reserve(data->size() * 2);\n'
+        '    for (const auto &byte : *data) {\n'
+        '        out.push_back(kHex[(byte >> 4) & 0x0F]);\n'
+        '        out.push_back(kHex[byte & 0x0F]);\n'
+        '    }\n'
+        '    return out;\n'
+        '}'
+    ),
 ]
 
 for file_pattern, search, replace in conflicts:

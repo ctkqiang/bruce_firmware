@@ -11,7 +11,7 @@
 #include "rf_send.h"
 #include "protocols/rf_protocol_engine.h"
 #include <globals.h>
-#include <sstream>
+#include <cctype>
 
 #define RF_M5_SCAN_COOLDOWN_MS 500
 #define RF_M5_SCAN_DUPLICATE_MS 1500
@@ -958,13 +958,16 @@ void display_signal_data(RfCodes received, bool headless) {
         rf_info_line(headless, received.decodedText);
         return;
     }
-    std::string txt = received.data.c_str();
-    std::stringstream ss(txt);
-    std::string palavra;
     int transitions = 0;
     char hexString[64];
-
-    while (ss >> palavra) transitions++;
+    const char *p = received.data.c_str();
+    while (*p) {
+        while (*p && isspace(static_cast<unsigned char>(*p))) ++p;
+        if (*p) {
+            transitions++;
+            while (*p && !isspace(static_cast<unsigned char>(*p))) ++p;
+        }
+    }
 
     if (received.preset != "") {
         if (received.fix != 0) {

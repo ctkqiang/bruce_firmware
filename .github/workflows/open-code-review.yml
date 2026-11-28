@@ -1,0 +1,69 @@
+name: AI Code Review — Alibaba Open Code Review
+
+on:
+  pull_request_target:
+    branches: [main, development]
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: open-code-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  open-code-review:
+    name: Alibaba Open Code Review
+    # Run automatically on PR lifecycle events, or on-demand when a maintainer comments /open-code-review on a PR
+    if: >-
+      (github.event_name == 'pull_request_target' && !github.event.pull_request.draft) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
+        (contains(github.event.comment.body, '/open-code-review') || contains(github.event.comment.body, '@open-code-review'))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Security invariant: NEVER execute untrusted PR code inside a pull_request_target workflow.
+      # Only inspect secret availability and invoke alibaba/open-code-review directly.
+      - name: Check Open Code Review LLM configuration
+        id: config
+        env:
+          HAS_URL: ${{ secrets.OCR_LLM_URL != '' }}
+          HAS_TOKEN: ${{ secrets.OCR_LLM_AUTH_TOKEN != '' }}
+        run: |
+          if [ "$HAS_URL" = "true" ] && [ "$HAS_TOKEN" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Alibaba Open Code Review skipped: configure OCR_LLM_URL and OCR_LLM_AUTH_TOKEN in Repository Settings -> Secrets and variables -> Actions."
+            cat <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          ### Alibaba Open Code Review (`alibaba/open-code-review`) — Setup Required
+
+          To activate automated AI + static hybrid PR reviews, add the following in **Settings → Secrets and variables → Actions**:
+
+          | Type | Name | Example |
+          | :--- | :--- | :--- |
+          | Secret | `OCR_LLM_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` or `https://api.openai.com/v1` |
+          | Secret | `OCR_LLM_AUTH_TOKEN` | Your LLM API key |
+          | Variable *(optional)* | `OCR_LLM_MODEL` | `qwen-plus`, `claude-sonnet-4-20250514`, or `gpt-4o` |
+          | Variable *(optional)* | `OCR_LLM_USE_ANTHROPIC` | `true` (for Anthropic API) or `false` (default, OpenAI-compatible) |
+          EOF
+          fi
+
+      - name: Run Alibaba Open Code Review
+        if: steps.config.outputs.enabled == 'true'
+        uses: alibaba/open-code-review@main
+        with:
+          llm_url: ${{ secrets.OCR_LLM_URL }}
+          llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          llm_model: ${{ vars.OCR_LLM_MODEL }}
+          llm_use_anthropic: ${{ vars.OCR_LLM_USE_ANTHROPIC }}
+          upload_artifacts: true

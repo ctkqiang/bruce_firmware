@@ -12,6 +12,8 @@ import argparse
 import csv
 import hashlib
 import json
+import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +24,98 @@ EDITION_LABELS = {
     "compact": "Compact (<4MB)",
     "lite": "Launcher Lite (<4MB)",
 }
+
+CHANGELOG_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
+    ("feat", "### 🚀 New Features / 新功能", ("feat",)),
+    ("fix", "### 🐛 Bug Fixes / 问题修复", ("fix",)),
+    ("ui", "### 🎨 UI, Themes & Web Portal / 界面、主题与刷机台", ("ui", "style")),
+    ("perf", "### ⚡ Performance & Memory / 性能与内存优化", ("perf",)),
+    ("i18n", "### 🌍 i18n & CJK Fonts / 多语言与中文字库", ("i18n",)),
+    ("other", "### 🔧 CI, Build, Security & Docs / 构建、CI、安全与文档", ("ci", "build", "chore", "docs", "refactor", "test", "sec", "security")),
+]
+
+
+def run_git(args: list[str], cwd: Path) -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def find_previous_tag(current_tag: str, repo_dir: Path) -> str:
+    raw = run_git(["tag", "-l", "v[0-9]*.[0-9]*", "--sort=-v:refname"], repo_dir)
+    for line in raw.splitlines():
+        tag = line.strip()
+        if tag and tag != current_tag:
+            return tag
+    return ""
+
+
+def build_changelog_markdown(current_tag: str, prev_tag: str, repo: str, repo_dir: Path) -> str:
+    rev_range = f"{prev_tag}..HEAD" if prev_tag else "HEAD~30..HEAD"
+    raw = run_git(["log", rev_range, "--no-merges", "--pretty=format:%h%x09%s%x09%an"], repo_dir)
+    if not raw and not prev_tag:
+        raw = run_git(["log", "-n", "30", "--no-merges", "--pretty=format:%h%x09%s%x09%an"], repo_dir)
+    if not raw:
+        return "_No new commit entries found for this release range._\n"
+
+    buckets: dict[str, list[str]] = {k: [] for k, _, _ in CHANGELOG_GROUPS}
+    seen_subjects: set[str] = set()
+    conv_re = re.compile(r"^([a-zA-Z]+)(?:\(([^)]+)\))?(!)?:\s*(.+)$")
+
+    for line in raw.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 2:
+            continue
+        short_sha, subject = parts[0].strip(), parts[1].strip()
+        if not subject or subject in seen_subjects:
+            continue
+        seen_subjects.add(subject)
+
+        m = conv_re.match(subject)
+        bucket = "other"
+        display = subject
+        if m:
+            ctype = m.group(1).lower()
+            scope = (m.group(2) or "").strip()
+            breaking = bool(m.group(3))
+            desc = m.group(4).strip()
+            if ctype in ("feat", "fix", "perf", "i18n"):
+                bucket = ctype
+            elif ctype in ("ui", "style") or (scope and any(k in scope.lower() for k in ("ui", "portal", "theme"))):
+                bucket = "ui"
+            else:
+                bucket = "other"
+            prefix = f"**{scope}:** " if scope else ""
+            brk = "⚠️ **[BREAKING]** " if breaking else ""
+            display = f"{brk}{prefix}{desc}"
+
+        commit_url = f"https://github.com/{repo}/commit/{short_sha}"
+        buckets[bucket].append(f"- {display} ([`{short_sha}`]({commit_url}))")
+
+    sections: list[str] = []
+    for key, heading, _ in CHANGELOG_GROUPS:
+        items = buckets[key]
+        if not items:
+            continue
+        capped = items[:25]
+        body = "\n".join(capped)
+        if len(items) > 25:
+            body += f"\n- _...and {len(items) - 25} more commits._"
+        sections.append(f"{heading}\n\n{body}")
+
+    if prev_tag:
+        compare_url = f"https://github.com/{repo}/compare/{prev_tag}...{current_tag}"
+        sections.append(f"**Full Changelog / 完整提交对比:** [`{prev_tag}...{current_tag}`]({compare_url})")
+
+    return "\n\n".join(sections) + "\n"
 
 
 def sha256_file(path: Path) -> str:
@@ -84,6 +178,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Generate Nezha Cyber GitHub Release manifest and notes")
     parser.add_argument("--assets-dir", type=Path, default=Path("release-assets"))
     parser.add_argument("--tag", required=True)
+    parser.add_argument("--prev-tag", default="", help="Previous release tag for changelog comparison")
+    parser.add_argument("--repo-dir", type=Path, default=Path("."), help="Git repository directory for changelog")
     parser.add_argument("--channel", choices=["stable", "beta"], default=None)
     parser.add_argument("--repo", default="NezhaCyber/nezha_cyber_firmware")
     parser.add_argument("--notes-out", type=Path, default=Path("RELEASE_NOTES.md"))
@@ -200,13 +296,21 @@ def main() -> int:
     owner = args.repo.split("/")[0].lower()
     repo_name = args.repo.split("/")[-1]
     portal_url = f"https://{owner}.github.io/{repo_name}/"
+    prev_tag = args.prev_tag.strip() or find_previous_tag(args.tag, args.repo_dir.resolve())
+    changelog_md = build_changelog_markdown(args.tag, prev_tag, args.repo, args.repo_dir.resolve())
+    board_count = len(metas)
+    commit_sha = run_git(["rev-parse", "--short", "HEAD"], args.repo_dir.resolve()) or "unknown"
 
     notes = (
         f"# 🔥 Nezha Cyber (哪吒网络安全) `{args.tag}` ({channel_badge})\n\n"
-        f"**Author / 作者:** 钟智强 ([ctkqiang](https://github.com/ctkqiang))  \n"
+        f"**Release Date / 发布日期:** `{release_date}` · **Commit:** `{commit_sha}` · **Targets:** `{board_count}` boards  \n"
+        f"**Author & Maintainer / 作者与维护者:** 钟智强 ([ctkqiang](https://github.com/ctkqiang))  \n"
         f"**Web Flasher Portal / 网页在线刷机台:** [{portal_url}]({portal_url})  \n"
         f"**Standalone Fork Lineage:** Independently evolved from Bruce Firmware "
-        f"(full upstream Git history preserved under AGPL-3.0).\n\n"
+        f"(full upstream Git history preserved under GNU AGPL-3.0).\n\n"
+        f"---\n\n"
+        f"## 📝 What's Changed / 本次更新内容\n\n"
+        f"{changelog_md}\n"
         f"---\n\n"
         f"## 📦 Firmware Memory & Device Matrix / 各设备固件容量与内存占用\n\n"
         f"> **Hardware Memory Selection Guide / 设备选型提示**\n"
@@ -221,12 +325,13 @@ def main() -> int:
         f"- **`NezhaCyber-*-ota.bin`**: App-only OTA / M5Launcher images (matched per board in `manifest.json`).\n"
         f"- **`NezhaCyber-sd-files.zip`**: Optional microSD card resources (JS scripts, IR/RF samples, themes).\n"
         f"- **`manifest.json`** & **`SHA256SUMS.txt`**: Machine-readable memory metadata (used by Web Portal & `make install-release`) and SHA-256 checksums.\n\n"
-        f"## ⚡ Quick Install / 快速安装\n\n"
+        f"## ⚡ Quick Install & Verification / 快速安装与校验\n\n"
         f"```sh\n"
         f"# Option 1: Browser Web Serial (no install needed) -> {portal_url}\n\n"
         f"# Option 2: CLI auto-detect chip & flash size and install this exact release\n"
         f"make install RELEASE={args.tag}\n\n"
-        f"# Option 3: Direct esptool flash\n"
+        f"# Option 3: Verify SHA-256 checksums & flash with esptool\n"
+        f"sha256sum -c SHA256SUMS.txt --ignore-missing\n"
         f"esptool --chip esp32s3 --port /dev/ttyACM0 --baud 921600 write_flash 0x00000 NezhaCyber-lilygo-t-deck.bin\n"
         f"esptool --chip esp32   --port /dev/ttyUSB0 --baud 921600 write_flash 0x00000 NezhaCyber-m5stack-cplus1_1.bin\n"
         f"```\n\n"

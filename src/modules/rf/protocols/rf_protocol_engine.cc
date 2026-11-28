@@ -8,10 +8,13 @@
 #include <ArduinoJson.h>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
-#include <sstream>
 #include <string>
 #include <esp_heap_caps.h>
 #if !defined(LITE_VERSION)
@@ -57,11 +60,13 @@ bool parse(
     };
     if (!input || strnlen(input, maxInput + 1) > maxInput)
         return reject("SubGhz file exceeds import size limit");
-    std::istringstream stream(input);
-    std::string line;
     uint64_t total = 0;
-    while (std::getline(stream, line)) {
-        line = trim(line);
+    const char *cursor = input;
+    while (*cursor) {
+        const char *nl = strchr(cursor, '\n');
+        size_t lineLen = nl ? static_cast<size_t>(nl - cursor) : strlen(cursor);
+        std::string line = trim(std::string(cursor, lineLen));
+        cursor = nl ? nl + 1 : cursor + lineLen;
         if (line.empty() || line[0] == '#') continue;
         // Older Bruce captures omitted the colon in this one header field.
         // Accept those saved files without weakening other field validation.
@@ -76,19 +81,21 @@ bool parse(
         if (key.empty() || key.size() > 128 || fields.size() >= 256) return false;
         if (key == "RAW_Data" || key == "Data_RAW") {
             if (!pulses) continue;
-            std::istringstream values(value);
-            std::string token;
-            while (values >> token) {
+            const char *vp = value.c_str();
+            while (*vp) {
+                while (*vp && isspace(static_cast<unsigned char>(*vp))) ++vp;
+                if (!*vp) break;
                 errno = 0;
-                char *end;
-                long duration = strtol(token.c_str(), &end, 10);
-                if (errno || *end || end == token.c_str() || !duration || duration < -1000000 ||
-                    duration > 1000000)
+                char *end = nullptr;
+                long duration = strtol(vp, &end, 10);
+                if (errno || end == vp || (*end != '\0' && !isspace(static_cast<unsigned char>(*end))) ||
+                    !duration || duration < -1000000 || duration > 1000000)
                     return reject("Invalid RAW pulse duration");
                 if (pulses->size() >= maxPulses) return reject("RAW capture exceeds pulse limit");
                 total += duration < 0 ? -duration : duration;
                 if (total > RF_MAX_CAPTURE_DURATION_US) return reject("RAW capture exceeds 60 seconds");
                 pulses->push_back((int)duration);
+                vp = end;
             }
         } else if (!fields.emplace(key, value).second) return false;
     }
@@ -164,15 +171,28 @@ bool nativeFields(const Fields &f, RfCodes &out) {
     return true;
 }
 String rawFile(const std::vector<int> &pulses, uint32_t frequency, const String &preset) {
-    std::ostringstream text;
-    text << "Filetype: Flipper SubGhz RAW File\nVersion: 1\nFrequency: " << frequency
-         << "\nPreset: " << preset.c_str() << "\nProtocol: RAW\n";
+    std::string text;
+    text.reserve(pulses.size() * 6 + 128);
+    char headerBuf[160];
+    int hlen = snprintf(
+        headerBuf,
+        sizeof(headerBuf),
+        "Filetype: Flipper SubGhz RAW File\nVersion: 1\nFrequency: %lu\nPreset: %s\nProtocol: RAW\n",
+        static_cast<unsigned long>(frequency),
+        preset.c_str()
+    );
+    if (hlen > 0) text.append(headerBuf, static_cast<size_t>(hlen));
+    char numBuf[16];
     for (size_t i = 0; i < pulses.size(); i++) {
-        if (i % 512 == 0) text << (i ? "\n" : "") << "RAW_Data:";
-        text << ' ' << pulses[i];
+        if (i % 512 == 0) {
+            if (i) text.push_back('\n');
+            text.append("RAW_Data:");
+        }
+        int n = snprintf(numBuf, sizeof(numBuf), " %d", pulses[i]);
+        if (n > 0) text.append(numBuf, static_cast<size_t>(n));
     }
-    text << '\n';
-    return text.str().c_str();
+    text.push_back('\n');
+    return text.c_str();
 }
 bool validPulses(
     const std::vector<int> &pulses, uint64_t maxDuration = MaxTransmitDuration, size_t maxPulses = MaxPulses
@@ -272,16 +292,37 @@ String rf_protocol_serialize(const RfCodes &code) {
     snprintf(seed, sizeof(seed), "%08lX", (unsigned long)code.seed);
     snprintf(fix, sizeof(fix), "%08lX", (unsigned long)code.fix);
     snprintf(hop, sizeof(hop), "%08lX", (unsigned long)code.hop);
-    std::ostringstream out;
-    out << "Filetype: Flipper SubGhz Key File\nVersion: 1\nFrequency: " << code.frequency
-        << "\nPreset: " << code.preset.c_str()
-        << "\nProtocol: " << rf_flipper_protocol_name(code.protocol).c_str() << "\nBit: " << code.Bit
-        << "\nKey:";
-    for (int i = 0; i < 16; i += 2) out << ' ' << key[i] << key[i + 1];
-    out << "\nTE: " << code.te << "\nSerial: " << serial << "\nButton: " << unsigned(code.btn)
-        << "\nCounter: " << code.cnt << "\nManufacture: " << code.mf_name.c_str() << "\nSeed: " << seed
-        << "\nFix: " << fix << "\nHop: " << hop << '\n';
-    return out.str().c_str();
+    char keySpaced[32];
+    int kp = 0;
+    for (int i = 0; i < 16; i += 2) {
+        keySpaced[kp++] = ' ';
+        keySpaced[kp++] = key[i];
+        keySpaced[kp++] = key[i + 1];
+    }
+    keySpaced[kp] = '\0';
+    String protoName = rf_flipper_protocol_name(code.protocol);
+    char buf[384];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "Filetype: Flipper SubGhz Key File\nVersion: 1\nFrequency: %lu\nPreset: %s\nProtocol: %s\n"
+        "Bit: %d\nKey:%s\nTE: %lu\nSerial: %s\nButton: %u\nCounter: %lu\nManufacture: %s\n"
+        "Seed: %s\nFix: %s\nHop: %s\n",
+        static_cast<unsigned long>(code.frequency),
+        code.preset.c_str(),
+        protoName.c_str(),
+        code.Bit,
+        keySpaced,
+        static_cast<unsigned long>(code.te),
+        serial,
+        static_cast<unsigned>(code.btn),
+        static_cast<unsigned long>(code.cnt),
+        code.mf_name.c_str(),
+        seed,
+        fix,
+        hop
+    );
+    return String(buf);
 }
 
 String rf_protocol_decode_json(const char *input) {
